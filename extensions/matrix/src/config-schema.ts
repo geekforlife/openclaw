@@ -98,6 +98,9 @@ function hasCanonicalMatrixAccountStreaming(account: unknown): boolean {
   return typeof streaming === "object" && streaming !== null && !Array.isArray(streaming);
 }
 
+// Bounded at both levels so a captionless attachment is never delayed by more than a minute.
+const MatrixMediaHoldMsSchema = z.number().int().min(0).max(60_000).optional();
+
 export const MatrixConfigSchema = z.object({
   name: z.string().optional(),
   enabled: z.boolean().optional(),
@@ -113,6 +116,7 @@ export const MatrixConfigSchema = z.object({
         .object({
           joinIntro: z.boolean().optional(),
           requireMentionInBotThreads: z.boolean().optional(),
+          mediaHoldMs: MatrixMediaHoldMsSchema,
           accessToken: buildSecretInputSchema().optional(),
           password: buildSecretInputSchema().optional(),
         })
@@ -158,6 +162,7 @@ export const MatrixConfigSchema = z.object({
   startupVerificationCooldownHours: z.number().optional(),
   mediaMaxMb: z.number().optional(),
   historyLimit: z.number().int().min(0).optional(),
+  mediaHoldMs: MatrixMediaHoldMsSchema,
   autoJoin: z.enum(["always", "allowlist", "off"]).optional(),
   autoJoinAllowlist: AllowFromListSchema,
   groupAllowFrom: AllowFromListSchema,
