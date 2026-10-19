@@ -8,7 +8,7 @@ import {
   createMatrixRoomMessageEvent,
   createMatrixTextMessageEvent,
 } from "./handler.test-helpers.js";
-import { createMatrixMediaHold } from "./media-hold.js";
+import { createMatrixHoldControlCommandCheck, createMatrixMediaHold } from "./media-hold.js";
 import type { MatrixRawEvent, RoomMessageEventContent } from "./types.js";
 
 const { downloadMatrixMediaMock } = vi.hoisted(() => ({
@@ -308,6 +308,33 @@ describe("createMatrixMediaHold", () => {
     expect(order.slice(0, 4).filter((step) => step.startsWith("adopted:"))).toHaveLength(2);
   });
 
+  it("does not join replayed text sent outside the hold window", async () => {
+    const { hold, ids } = createHold();
+    const sentAt = 1_700_000_000_000;
+
+    await hold.onRoomMessage(
+      ROOM,
+      createMatrixRoomMessageEvent({
+        eventId: "$stale",
+        sender: USER,
+        originServerTs: sentAt,
+        content: { msgtype: "m.image", body: "photo.png", url: "mxc://example.org/photo" },
+      }),
+      claim(),
+    );
+    await hold.onRoomMessage(
+      ROOM,
+      createMatrixTextMessageEvent({
+        eventId: "$later",
+        body: "unrelated, hours later",
+        originServerTs: sentAt + HOLD_MS + 1,
+      }),
+      claim(),
+    );
+
+    expect(ids()).toEqual(["$stale", "$later"]);
+  });
+
   it("only joins text from the same thread", async () => {
     const { hold, ids } = createHold();
 
@@ -391,6 +418,48 @@ describe("createMatrixMediaHold", () => {
     expect(media.onFailed).toHaveBeenCalledTimes(1);
     expect(text.onFailed).toHaveBeenCalledTimes(1);
     expect(media.onAdopted).not.toHaveBeenCalled();
+  });
+});
+
+describe("createMatrixHoldControlCommandCheck", () => {
+  beforeEach(() => {
+    installMatrixMonitorTestRuntime();
+  });
+
+  it("uses the live config, the handler's mention stripping and the canonical command predicate", async () => {
+    const liveCfg = { agents: {} };
+    const isControlCommandMessage = vi.fn((text: string) => text === "stop" || text === "/stop");
+    const buildMentionRegexes = vi.fn(() => [/^openclaw\b/i]);
+    const check = createMatrixHoldControlCommandCheck({
+      core: {
+        config: { current: () => liveCfg },
+        channel: {
+          routing: {
+            resolveAgentRoute: () => ({
+              agentId: "main",
+              channel: "matrix",
+              accountId: "ops",
+              sessionKey: "agent:main:main",
+              mainSessionKey: "agent:main:main",
+              matchedBy: "binding.account",
+            }),
+          },
+          mentions: { buildMentionRegexes },
+          commands: { isControlCommandMessage },
+        },
+      } as never,
+      accountId: "ops",
+      accountConfig: {},
+      selfUserId: BOT,
+      directTracker: { isDirectMessage: async () => true },
+      getMemberDisplayName: async () => "OpenClaw",
+    });
+
+    await expect(check(ROOM, textEvent("$bare", "stop"))).resolves.toBe(true);
+    await expect(check(ROOM, textEvent("$prefixed", "OpenClaw: /stop"))).resolves.toBe(true);
+    await expect(check(ROOM, textEvent("$plain", "what is this?"))).resolves.toBe(false);
+    expect(isControlCommandMessage).toHaveBeenLastCalledWith("what is this?", liveCfg);
+    expect(buildMentionRegexes).toHaveBeenCalledWith(liveCfg, "main", expect.any(Object));
   });
 });
 

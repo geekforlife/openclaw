@@ -487,7 +487,6 @@ export async function monitorMatrixProvider(opts: MonitorMatrixOpts = {}): Promi
             dispatch: dispatchRoomMessage,
             isControlCommand: createMatrixHoldControlCommandCheck({
               core,
-              cfg,
               accountId: effectiveAccountId,
               accountConfig,
               dmSessionScope,

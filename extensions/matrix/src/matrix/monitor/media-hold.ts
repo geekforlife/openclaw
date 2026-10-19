@@ -136,8 +136,7 @@ export function mergeMatrixMediaCaption(
  * name) for a text that would otherwise join a held attachment.
  */
 export function createMatrixHoldControlCommandCheck(params: {
-  core: Pick<PluginRuntime, "channel">;
-  cfg: CoreConfig;
+  core: Pick<PluginRuntime, "channel" | "config">;
   accountId: string;
   accountConfig: MatrixConfig;
   dmSessionScope?: "per-user" | "per-room";
@@ -146,6 +145,10 @@ export function createMatrixHoldControlCommandCheck(params: {
   getMemberDisplayName: (roomId: string, userId: string) => Promise<string>;
 }) {
   return async (roomId: string, event: MatrixRawEvent): Promise<boolean> => {
+    // The same live snapshot normal ingress reads, so a hot-reloaded mention
+    // pattern is recognised here before it would be by the handler.
+    // SAFETY: the runtime's current config is the OpenClaw config this plugin reads as CoreConfig.
+    const cfg = params.core.config.current() as CoreConfig;
     const content = asRoomMessageContent(event);
     const senderId = event.sender ?? "";
     const isDirectMessage = await params.directTracker.isDirectMessage({
@@ -154,7 +157,7 @@ export function createMatrixHoldControlCommandCheck(params: {
       selfUserId: params.selfUserId,
     });
     const { route } = await resolveMatrixInboundRouteAsync({
-      cfg: params.cfg,
+      cfg,
       accountId: params.accountId,
       roomId,
       senderId,
@@ -168,7 +171,7 @@ export function createMatrixHoldControlCommandCheck(params: {
       : undefined;
     const { commandCheckText } = resolveMatrixCommandCheckText({
       core: params.core,
-      cfg: params.cfg,
+      cfg,
       agentId: route.agentId,
       roomId,
       mentionPatterns: params.accountConfig.mentionPatterns,
@@ -176,8 +179,14 @@ export function createMatrixHoldControlCommandCheck(params: {
       selfDisplayName,
       text: resolveMatrixMentionPrecheckText({ eventType: event.type, content }),
     });
-    return params.core.channel.text.hasControlCommand(commandCheckText, params.cfg);
+    // The canonical predicate: configured commands plus bare abort triggers ("stop").
+    return params.core.channel.commands.isControlCommandMessage(commandCheckText, cfg);
   };
+}
+
+function isWithinHoldWindow(media: MatrixRawEvent, text: MatrixRawEvent, holdMs: number) {
+  const delta = text.origin_server_ts - media.origin_server_ts;
+  return Number.isFinite(delta) && delta >= 0 && delta <= holdMs;
 }
 
 /**
@@ -257,11 +266,14 @@ export function createMatrixMediaHold(params: {
       entry.kind === "media" || (entry.kind === "text" && pending) ? holdMs : 0,
     // Only the held attachment's own sender can complete it; anything else in the
     // conversation dispatches it first so delivery order is preserved.
+    // A replay after downtime drains old events back to back, so the text must
+    // also have been sent within the hold window of the attachment, by server time.
     canAppend: (entry, pending) =>
       entry.kind === "text" &&
       pending.length === 1 &&
       pending[0]?.kind === "media" &&
-      pending[0].event.sender === entry.event.sender,
+      pending[0].event.sender === entry.event.sender &&
+      isWithinHoldWindow(pending[0].event, entry.event, holdMs),
     onFlush: (entries, createFlush) => {
       for (const entry of entries) {
         forget(entry);
