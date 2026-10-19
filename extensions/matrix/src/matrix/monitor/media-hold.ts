@@ -21,6 +21,7 @@ import { resolveMatrixThreadRootId } from "../relations.js";
 import { RelationType } from "../send/types.js";
 import type { createDirectRoomTracker } from "./direct.js";
 import {
+  hasBundledMatrixReplacementRelation,
   resolveMatrixInboundMediaContent,
   resolveMatrixMentionPrecheckText,
 } from "./handler-helpers.js";
@@ -68,12 +69,29 @@ function isHoldableMedia(content: RoomMessageEventContent): boolean {
   if (!resolveMatrixInboundMediaContent(content).url) {
     return false;
   }
-  const attachment = resolveMatrixMessageAttachment({
-    body: typeof content.body === "string" ? content.body : undefined,
-    filename: typeof content.filename === "string" ? content.filename : undefined,
-    msgtype,
-  });
-  return attachment !== undefined && !attachment.caption;
+  const body = typeof content.body === "string" ? content.body : undefined;
+  const filename = typeof content.filename === "string" ? content.filename : undefined;
+  const attachment = resolveMatrixMessageAttachment({ body, filename, msgtype });
+  if (attachment === undefined) {
+    return false;
+  }
+  if (!attachment.caption) {
+    return true;
+  }
+  // Clients that predate MSC2530 send no `filename` and put the file name in
+  // `body`; "vacation photo.jpg" is a name there, not a caption.
+  return filename === undefined && body !== undefined && isLegacyMediaFilenameBody(body);
+}
+
+function isLegacyMediaFilenameBody(body: string): boolean {
+  const trimmed = body.trim();
+  return (
+    trimmed.length > 0 &&
+    trimmed.length <= 255 &&
+    !/[\r\n]/.test(trimmed) &&
+    !/[.!?]\s/.test(trimmed) &&
+    /\.[A-Za-z0-9]{1,8}$/.test(trimmed)
+  );
 }
 
 /** Fold a text event into a captionless attachment as an MSC2530 caption. */
@@ -164,11 +182,17 @@ export function createMatrixHoldControlCommandCheck(params: {
 
 /**
  * Events the handler turns into messages or acts on. Anything else (and the
- * bot's own events, redactions and edits, which the handler ignores) bypasses
- * the hold so it can never release an attachment early.
+ * bot's own events, redactions and edits, which the handler ignores, including
+ * an original the server already bundles a replacement for) bypasses the hold
+ * so it can never release an attachment early or be folded into one.
  */
 function classifyHoldKind(event: MatrixRawEvent, selfUserId: string): HoldKind | undefined {
-  if (!event.sender || event.sender === selfUserId || event.unsigned?.redacted_because) {
+  if (
+    !event.sender ||
+    event.sender === selfUserId ||
+    event.unsigned?.redacted_because ||
+    hasBundledMatrixReplacementRelation(event)
+  ) {
     return undefined;
   }
   if (isPollEventType(event.type) || event.type === EventType.Location) {

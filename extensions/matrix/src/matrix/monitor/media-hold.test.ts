@@ -240,6 +240,49 @@ describe("createMatrixMediaHold", () => {
     expect(ids()).toEqual(["$image", "$poll"]);
   });
 
+  it("holds a legacy attachment whose file name sits in the body with spaces", async () => {
+    const { hold, calls } = createHold();
+
+    await hold.onRoomMessage(ROOM, imageEvent("$legacy", { body: "vacation photo.jpg" }), claim());
+    expect(calls).toHaveLength(0);
+    await hold.onRoomMessage(ROOM, textEvent("$text", "where was this?"), claim());
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.event.content).toMatchObject({
+      msgtype: "m.image",
+      filename: "vacation photo.jpg",
+      body: "where was this?",
+    });
+  });
+
+  it("never folds or holds an event the server already bundles an edit for", async () => {
+    const { hold, calls, ids } = createHold();
+    const edited = { "m.relations": { "m.replace": { event_id: "$edit" } } };
+
+    await hold.onRoomMessage(ROOM, imageEvent("$image"), claim());
+    await hold.onRoomMessage(
+      ROOM,
+      createMatrixTextMessageEvent({ eventId: "$editedText", body: "old text", unsigned: edited }),
+      claim(),
+    );
+    expect(ids()).toEqual(["$editedText"]);
+    await vi.advanceTimersByTimeAsync(HOLD_MS);
+    expect(ids()).toEqual(["$editedText", "$image"]);
+    expect(calls[1]?.event.content.body).toBe("photo.png");
+
+    await hold.onRoomMessage(
+      ROOM,
+      createMatrixRoomMessageEvent({
+        eventId: "$editedImage",
+        sender: USER,
+        unsigned: edited,
+        content: { msgtype: "m.image", body: "photo.png", url: "mxc://example.org/photo" },
+      }),
+      claim(),
+    );
+    expect(ids()).toEqual(["$editedText", "$image", "$editedImage"]);
+  });
+
   it("only joins text from the same thread", async () => {
     const { hold, ids } = createHold();
 
