@@ -1,10 +1,9 @@
 // Matrix tests cover the optional hold that joins a captionless attachment with its text.
 import type { ChannelIngressMonitorLifecycle } from "openclaw/plugin-sdk/channel-outbound";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import { installMatrixMonitorTestRuntime } from "../../test-runtime.js";
 import {
   createMatrixHandlerTestHarness,
-  createMatrixIngressLifecycle,
   createMatrixRoomMessageEvent,
   createMatrixTextMessageEvent,
 } from "./handler.test-helpers.js";
@@ -55,12 +54,25 @@ function textEvent(eventId: string, body: string, sender = USER, threadRootId?: 
   });
 }
 
-type Lifecycle = ReturnType<typeof createMatrixIngressLifecycle> & {
-  onCancelled?: ReturnType<typeof vi.fn>;
+/** One durable ingress claim as the drain hands it to a delivery, with observable callbacks. */
+type Claim = ChannelIngressMonitorLifecycle & {
+  onAdopted: Mock<() => Promise<void>>;
+  onCancelled: Mock<() => Promise<void>>;
+  onDeferredHeartbeat?: Mock<() => void>;
+  onFailed?: Mock<(error: unknown) => Promise<void>>;
 };
 
-function claim(extra: Partial<Lifecycle> = {}): Lifecycle {
-  return { ...createMatrixIngressLifecycle(), onCancelled: vi.fn(async () => {}), ...extra };
+function claim(extra: Partial<Claim> = {}): Claim {
+  return {
+    admission: "exclusive",
+    abortSignal: new AbortController().signal,
+    onAdopted: vi.fn(async () => {}),
+    onDeferred: vi.fn(),
+    onAdoptionFinalizing: vi.fn(),
+    onAbandoned: vi.fn(async () => {}),
+    onCancelled: vi.fn(async () => {}),
+    ...extra,
+  };
 }
 
 type DispatchCall = {
@@ -148,15 +160,16 @@ describe("createMatrixMediaHold", () => {
 
   it("keeps the held claim alive with deferred heartbeats while it waits", async () => {
     const { hold } = createHold();
-    const media = claim({ onDeferredHeartbeat: vi.fn(), deferredHeartbeatIntervalMs: 4_000 });
+    const heartbeat = vi.fn();
+    const media = claim({ onDeferredHeartbeat: heartbeat, deferredHeartbeatIntervalMs: 4_000 });
 
     await hold.onRoomMessage(ROOM, imageEvent("$image"), media);
     await vi.advanceTimersByTimeAsync(9_000);
-    expect(media.onDeferredHeartbeat).toHaveBeenCalledTimes(2);
+    expect(heartbeat).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(HOLD_MS);
-    const beats = media.onDeferredHeartbeat.mock.calls.length;
+    const beats = heartbeat.mock.calls.length;
     await vi.advanceTimersByTimeAsync(HOLD_MS);
-    expect(media.onDeferredHeartbeat).toHaveBeenCalledTimes(beats);
+    expect(heartbeat).toHaveBeenCalledTimes(beats);
   });
 
   it("dispatches a held attachment first when a second attachment arrives", async () => {
