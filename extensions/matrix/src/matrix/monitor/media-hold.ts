@@ -28,6 +28,7 @@ import {
 } from "./handler-helpers.js";
 import { resolveMatrixCommandCheckText } from "./mentions.js";
 import { resolveMatrixInboundRouteAsync } from "./route.js";
+import { resolveMatrixThreadRouting } from "./threads.js";
 import { EventType, type MatrixRawEvent, type RoomMessageEventContent } from "./types.js";
 import { isMatrixVerificationRoomMessage } from "./verification-utils.js";
 
@@ -144,6 +145,8 @@ export function createMatrixHoldControlCommandCheck(params: {
   accountId: string;
   accountConfig: MatrixConfig;
   dmSessionScope?: "per-user" | "per-room";
+  threadReplies: "off" | "inbound" | "always";
+  dmThreadReplies?: "off" | "inbound" | "always";
   selfUserId: string;
   directTracker: Pick<ReturnType<typeof createDirectRoomTracker>, "isDirectMessage">;
   getMemberDisplayName: (roomId: string, userId: string) => Promise<string>;
@@ -160,6 +163,15 @@ export function createMatrixHoldControlCommandCheck(params: {
       senderId,
       selfUserId: params.selfUserId,
     });
+    // The same effective thread normal ingress routes by, so a thread bound to
+    // another agent only applies when thread replies are on.
+    const { threadId } = resolveMatrixThreadRouting({
+      isDirectMessage,
+      threadReplies: params.threadReplies,
+      dmThreadReplies: params.dmThreadReplies,
+      messageId: event.event_id,
+      threadRootId: resolveMatrixThreadRootId(content),
+    });
     const { route } = await resolveMatrixInboundRouteAsync({
       cfg,
       accountId: params.accountId,
@@ -167,7 +179,7 @@ export function createMatrixHoldControlCommandCheck(params: {
       senderId,
       isDirectMessage,
       dmSessionScope: params.dmSessionScope,
-      threadId: resolveMatrixThreadRootId(content) ?? undefined,
+      threadId,
       resolveAgentRoute: params.core.channel.routing.resolveAgentRoute,
     });
     const selfDisplayName = content.formatted_body

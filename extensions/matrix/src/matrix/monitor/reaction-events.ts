@@ -170,6 +170,47 @@ async function maybeResolveMatrixApprovalReaction(params: {
   }
 }
 
+/**
+ * Whether the reaction handler could act on this reaction at all: it resolves a
+ * pending approval, or reaction notifications are on and it targets one of the
+ * bot's own messages. Shared with the media hold, which must release held
+ * attachments only for reactions that may start work. A failed target lookup
+ * counts as "may start work" so delivery order is preserved.
+ */
+export async function resolveMatrixReactionMayStartWork(params: {
+  client: Pick<MatrixClient, "getEvent">;
+  cfg: CoreConfig;
+  accountId: string;
+  roomId: string;
+  event: MatrixRawEvent;
+  selfUserId: string;
+}): Promise<boolean> {
+  const reaction = extractMatrixReactionAnnotation(params.event.content);
+  if (!reaction?.eventId || params.event.sender === params.selfUserId) {
+    return false;
+  }
+  const approvalTarget = await resolveMatrixApprovalReactionTargetWithPersistence({
+    accountId: params.accountId,
+    roomId: params.roomId,
+    eventId: reaction.eventId,
+    reactionKey: reaction.key,
+  });
+  if (approvalTarget) {
+    return true;
+  }
+  if (
+    resolveMatrixReactionNotificationMode({ cfg: params.cfg, accountId: params.accountId }) ===
+    "off"
+  ) {
+    return false;
+  }
+  const target = await params.client.getEvent(params.roomId, reaction.eventId).catch(() => null);
+  if (!target) {
+    return true;
+  }
+  return typeof target.sender === "string" && target.sender.trim() === params.selfUserId;
+}
+
 export async function handleInboundMatrixReaction(params: {
   client: MatrixClient;
   core: PluginRuntime;

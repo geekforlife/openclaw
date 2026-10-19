@@ -54,9 +54,9 @@ import { createMatrixIngressMonitor } from "./ingress.js";
 import {
   createMatrixHoldControlCommandCheck,
   createMatrixMediaHold,
-  resolveReactionTargetId,
   type MatrixRoomMessageDispatch,
 } from "./media-hold.js";
+import { resolveMatrixReactionMayStartWork } from "./reaction-events.js";
 import { shouldPromoteRecentInviteRoom } from "./recent-invite.js";
 import { createMatrixRoomInfoResolver } from "./room-info.js";
 import { resolveMatrixRoomConfig } from "./rooms.js";
@@ -492,25 +492,24 @@ export async function monitorMatrixProvider(opts: MonitorMatrixOpts = {}): Promi
               accountId: effectiveAccountId,
               accountConfig,
               dmSessionScope,
+              threadReplies,
+              dmThreadReplies,
               selfUserId: auth.userId,
               directTracker,
               getMemberDisplayName,
             }),
-            // Approval reactions and reaction notifications only ever act on the
-            // bot's own messages; any other reaction is ignored by the handler.
-            reactionMayStartWork: async (roomId, event) => {
-              const targetId = resolveReactionTargetId(event);
-              if (!targetId) {
-                return false;
-              }
-              const target = await reactionClient.getEvent(roomId, targetId).catch(() => undefined);
-              if (target === undefined) {
-                // Unknown target: keep delivery order rather than risk the reaction
-                // overtaking a held attachment.
-                return true;
-              }
-              return typeof target?.sender === "string" && target.sender.trim() === auth.userId;
-            },
+            // The reaction handler's own preflight (approval targets, notification
+            // mode, target ownership), with the live config snapshot it reads.
+            reactionMayStartWork: (roomId, event) =>
+              resolveMatrixReactionMayStartWork({
+                client: reactionClient,
+                // SAFETY: the runtime's current config is the OpenClaw config this plugin reads as CoreConfig.
+                cfg: core.config.current() as CoreConfig,
+                accountId: effectiveAccountId,
+                roomId,
+                event,
+                selfUserId: auth.userId,
+              }),
             logVerboseMessage,
           })
         : null;

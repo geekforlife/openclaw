@@ -9,6 +9,7 @@ import {
   createMatrixTextMessageEvent,
 } from "./handler.test-helpers.js";
 import { createMatrixHoldControlCommandCheck, createMatrixMediaHold } from "./media-hold.js";
+import { resolveMatrixReactionMayStartWork } from "./reaction-events.js";
 import type { MatrixRawEvent, RoomMessageEventContent } from "./types.js";
 
 const { downloadMatrixMediaMock } = vi.hoisted(() => ({
@@ -699,6 +700,7 @@ describe("createMatrixHoldControlCommandCheck", () => {
       } as never,
       accountId: "ops",
       accountConfig: {},
+      threadReplies: "inbound",
       selfUserId: BOT,
       directTracker: { isDirectMessage: async () => true },
       getMemberDisplayName: async () => "OpenClaw",
@@ -709,6 +711,70 @@ describe("createMatrixHoldControlCommandCheck", () => {
     await expect(check(ROOM, textEvent("$plain", "what is this?"))).resolves.toBe(false);
     expect(isControlCommandMessage).toHaveBeenLastCalledWith("what is this?", liveCfg);
     expect(buildMentionRegexes).toHaveBeenCalledWith(liveCfg, "main", expect.any(Object));
+  });
+});
+
+describe("resolveMatrixReactionMayStartWork", () => {
+  beforeEach(() => {
+    installMatrixMonitorTestRuntime();
+  });
+
+  function reaction(targetEventId: string) {
+    return createMatrixReactionEvent({ eventId: "$reaction", targetEventId, key: "👍" });
+  }
+  const cfgWith = (mode?: "off" | "own") =>
+    ({ channels: { matrix: mode ? { reactionNotifications: mode } : {} } }) as never;
+
+  it("follows the reaction handler: notification mode, target ownership, lookup failure", async () => {
+    const client = {
+      getEvent: vi.fn(async (_roomId: string, eventId: string) =>
+        eventId === "$botMessage" ? { sender: BOT } : { sender: USER },
+      ),
+    };
+    const base = { client: client as never, accountId: "ops", roomId: ROOM, selfUserId: BOT };
+
+    await expect(
+      resolveMatrixReactionMayStartWork({
+        ...base,
+        cfg: cfgWith("own"),
+        event: reaction("$botMessage"),
+      }),
+    ).resolves.toBe(true);
+    await expect(
+      resolveMatrixReactionMayStartWork({
+        ...base,
+        cfg: cfgWith("own"),
+        event: reaction("$userMessage"),
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      resolveMatrixReactionMayStartWork({
+        ...base,
+        cfg: cfgWith("off"),
+        event: reaction("$botMessage"),
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      resolveMatrixReactionMayStartWork({
+        ...base,
+        cfg: cfgWith("own"),
+        event: createMatrixReactionEvent({
+          eventId: "$own",
+          targetEventId: "$x",
+          key: "👍",
+          sender: BOT,
+        }),
+      }),
+    ).resolves.toBe(false);
+
+    client.getEvent.mockRejectedValueOnce(new Error("transient"));
+    await expect(
+      resolveMatrixReactionMayStartWork({
+        ...base,
+        cfg: cfgWith("own"),
+        event: reaction("$botMessage"),
+      }),
+    ).resolves.toBe(true);
   });
 });
 
