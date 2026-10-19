@@ -85,6 +85,8 @@ type DispatchCall = {
 function createHold(
   params: {
     isControlCommand?: (roomId: string, event: MatrixRawEvent) => Promise<boolean>;
+    reactionMayStartWork?: (roomId: string, event: MatrixRawEvent) => Promise<boolean>;
+    holdMs?: number;
     /** What the handler does with each dispatched event (default: adopt the turn). */
     onDispatch?: (call: DispatchCall) => Promise<void>;
   } = {},
@@ -100,10 +102,11 @@ function createHold(
     },
   );
   const hold = createMatrixMediaHold({
-    holdMs: HOLD_MS,
+    holdMs: params.holdMs ?? HOLD_MS,
     selfUserId: BOT,
     dispatch,
     isControlCommand: params.isControlCommand ?? (async () => false),
+    reactionMayStartWork: params.reactionMayStartWork ?? (async () => true),
     logVerboseMessage: () => {},
   });
   return { hold, dispatch, calls, ids: () => calls.map((call) => call.event.event_id) };
@@ -299,7 +302,7 @@ describe("createMatrixMediaHold", () => {
     await hold.onRoomMessage(ROOM, imageEvent("$roomImage"), claim());
     await hold.onRoomMessage(
       ROOM,
-      createMatrixReactionEvent({ eventId: "$reaction", targetEventId: "$threadImage", key: "👍" }),
+      createMatrixReactionEvent({ eventId: "$reaction", targetEventId: "$botMessage", key: "👍" }),
       claim(),
     );
 
@@ -380,6 +383,7 @@ describe("createMatrixMediaHold", () => {
       selfUserId: BOT,
       dispatch: async () => {},
       isControlCommand: async () => false,
+      reactionMayStartWork: async () => false,
       logVerboseMessage: (message) => logged.push(message),
     });
     const media = claim({
@@ -394,6 +398,75 @@ describe("createMatrixMediaHold", () => {
 
     expect(media.onCancelled).toHaveBeenCalledTimes(1);
     expect(logged.some((line) => line.includes("could not reopen claim"))).toBe(true);
+  });
+
+  it("keeps the attachment's original deadline when it is replayed after a restart", async () => {
+    const { hold, ids } = createHold();
+    const sentAt = Date.now();
+
+    await hold.onRoomMessage(
+      ROOM,
+      createMatrixRoomMessageEvent({
+        eventId: "$replayed",
+        sender: USER,
+        originServerTs: sentAt - (HOLD_MS - 5_000),
+        content: { msgtype: "m.image", body: "photo.png", url: "mxc://example.org/photo" },
+      }),
+      claim(),
+    );
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(ids()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ids()).toEqual(["$replayed"]);
+
+    await hold.onRoomMessage(
+      ROOM,
+      createMatrixRoomMessageEvent({
+        eventId: "$expired",
+        sender: USER,
+        originServerTs: sentAt - HOLD_MS - 1,
+        content: { msgtype: "m.image", body: "photo.png", url: "mxc://example.org/photo" },
+      }),
+      claim(),
+    );
+    expect(ids()).toEqual(["$replayed", "$expired"]);
+  });
+
+  it("leaves a hold alone for a reaction the handler would ignore", async () => {
+    const reactionMayStartWork = vi.fn(
+      async (_roomId: string, event: MatrixRawEvent) =>
+        ((event.content as RoomMessageEventContent)["m.relates_to"] as { event_id?: string })
+          ?.event_id === "$botMessage",
+    );
+    const { hold, ids } = createHold({ reactionMayStartWork });
+
+    await hold.onRoomMessage(ROOM, imageEvent("$image"), claim());
+    // A reaction to the held attachment itself: never asked, never released.
+    await hold.onRoomMessage(
+      ROOM,
+      createMatrixReactionEvent({ eventId: "$onImage", targetEventId: "$image", key: "👍" }),
+      claim(),
+    );
+    expect(ids()).toEqual(["$onImage"]);
+    expect(reactionMayStartWork).not.toHaveBeenCalled();
+    // A reaction to some other user's message: ignored by the handler, hold kept.
+    await hold.onRoomMessage(
+      ROOM,
+      createMatrixReactionEvent({ eventId: "$onOther", targetEventId: "$someone", key: "👍" }),
+      claim(),
+    );
+    expect(ids()).toEqual(["$onImage", "$onOther"]);
+    await hold.onRoomMessage(ROOM, textEvent("$text", "what is this?"), claim());
+    expect(ids()).toEqual(["$onImage", "$onOther", "$text"]);
+
+    // A reaction to the bot's own message may start work: it releases a new hold first.
+    await hold.onRoomMessage(ROOM, imageEvent("$image2"), claim());
+    await hold.onRoomMessage(
+      ROOM,
+      createMatrixReactionEvent({ eventId: "$onBot", targetEventId: "$botMessage", key: "👍" }),
+      claim(),
+    );
+    expect(ids()).toEqual(["$onImage", "$onOther", "$text", "$image2", "$onBot"]);
   });
 
   it("only joins text from the same thread", async () => {
@@ -557,6 +630,7 @@ describe("Matrix media hold with the room message handler", () => {
       selfUserId: BOT,
       dispatch: handler,
       isControlCommand: async () => false,
+      reactionMayStartWork: async () => false,
       logVerboseMessage: () => {},
     });
     const media = claim();

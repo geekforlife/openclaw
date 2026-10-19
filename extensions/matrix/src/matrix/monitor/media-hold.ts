@@ -184,6 +184,14 @@ export function createMatrixHoldControlCommandCheck(params: {
   };
 }
 
+/** The event a reaction annotates, if the relation is well formed. */
+export function resolveReactionTargetId(event: MatrixRawEvent): string | undefined {
+  const relation = asRoomMessageContent(event)["m.relates_to"];
+  return relation?.rel_type === "m.annotation" && typeof relation.event_id === "string"
+    ? relation.event_id
+    : undefined;
+}
+
 function isWithinHoldWindow(media: MatrixRawEvent, text: MatrixRawEvent, holdMs: number) {
   const delta = text.origin_server_ts - media.origin_server_ts;
   return Number.isFinite(delta) && delta >= 0 && delta <= holdMs;
@@ -236,10 +244,23 @@ export function createMatrixMediaHold(params: {
   dispatch: MatrixRoomMessageDispatch;
   /** The handler's own control-command decision for a text event (mention-stripped). */
   isControlCommand: (roomId: string, event: MatrixRawEvent) => Promise<boolean>;
+  /**
+   * Whether the reaction handler could act on this reaction at all (approval
+   * reactions and reaction notifications both target the bot's own messages).
+   */
+  reactionMayStartWork: (roomId: string, event: MatrixRawEvent) => Promise<boolean>;
   logVerboseMessage: (message: string) => void;
+  now?: () => number;
 }) {
   const { holdMs } = params;
+  const now = params.now ?? Date.now;
   const heldByKey = new Map<string, HoldEntry>();
+  // The hold is measured from when the attachment was sent, so a replay after a
+  // restart keeps the original deadline instead of starting a new window.
+  const remainingHoldMs = (event: MatrixRawEvent) => {
+    const age = now() - event.origin_server_ts;
+    return Number.isFinite(age) ? Math.max(0, Math.min(holdMs, holdMs - age)) : holdMs;
+  };
   // Flushes that have left the hold but whose turn is not yet admitted, per room.
   const admittingByRoom = new Map<string, Set<Promise<void>>>();
   let closed = false;
@@ -274,11 +295,15 @@ export function createMatrixMediaHold(params: {
   const debouncer = createInboundDebouncer<HoldEntry>({
     debounceMs: holdMs,
     // The window is measured from the attachment; a joining text never extends it.
-    maxWaitMs: holdMs,
+    maxWaitMs: (entry) => (entry.kind === "media" ? remainingHoldMs(entry.event) : holdMs),
     buildKey: (entry) => entry.key,
     shouldDebounce: (entry) => entry.kind !== "other",
     resolveDebounceMs: (entry, pending) =>
-      entry.kind === "media" || (entry.kind === "text" && pending) ? holdMs : 0,
+      entry.kind === "media"
+        ? remainingHoldMs(entry.event)
+        : entry.kind === "text" && pending
+          ? holdMs
+          : 0,
     // Only the held attachment's own sender can complete it; anything else in the
     // conversation dispatches it first so delivery order is preserved.
     // A replay after downtime drains old events back to back, so the text must
@@ -376,20 +401,35 @@ export function createMatrixMediaHold(params: {
       return await params.dispatch(roomId, event, lifecycle);
     }
     if (kind === "reaction") {
-      // A reaction's thread is only known once its target is fetched, so it cannot
-      // be keyed; release every attachment held in the room, and let attachments
-      // already on their way to a turn be admitted, before it goes on.
-      await Promise.all(
-        Array.from(heldByKey.values())
-          .filter((held) => held.roomId === roomId)
-          .map((held) => debouncer.flushKey(held.key)),
+      // A reaction to a held attachment, or one the reaction handler would ignore,
+      // starts no work and must not release the hold. Otherwise the reaction's
+      // thread is only known once its target is fetched, so it cannot be keyed:
+      // release every attachment held in the room, and let attachments already on
+      // their way to a turn be admitted, before it goes on.
+      const targetId = resolveReactionTargetId(event);
+      const targetsHeld = Array.from(heldByKey.values()).some(
+        (held) => held.roomId === roomId && held.event.event_id === targetId,
       );
-      await Promise.allSettled(Array.from(admittingByRoom.get(roomId) ?? []));
+      if (!targetsHeld && (await params.reactionMayStartWork(roomId, event))) {
+        await Promise.all(
+          Array.from(heldByKey.values())
+            .filter((held) => held.roomId === roomId)
+            .map((held) => debouncer.flushKey(held.key)),
+        );
+        await Promise.allSettled(Array.from(admittingByRoom.get(roomId) ?? []));
+      }
       return await params.dispatch(roomId, event, lifecycle);
     }
     const key = `${roomId}\0${resolveMatrixThreadRootId(asRoomMessageContent(event)) ?? ""}`;
-    const entry: HoldEntry = { roomId, event, lifecycle, key, kind };
-    if (kind === "media") {
+    // A replayed attachment whose window has already passed goes straight on.
+    const entry: HoldEntry = {
+      roomId,
+      event,
+      lifecycle,
+      key,
+      kind: kind === "media" && remainingHoldMs(event) <= 0 ? "other" : kind,
+    };
+    if (entry.kind === "media") {
       hold(entry);
       void debouncer.enqueue(entry);
       // The claim stays with the attachment while it waits; deferring frees the room lane.

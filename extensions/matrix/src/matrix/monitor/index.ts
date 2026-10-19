@@ -54,6 +54,7 @@ import { createMatrixIngressMonitor } from "./ingress.js";
 import {
   createMatrixHoldControlCommandCheck,
   createMatrixMediaHold,
+  resolveReactionTargetId,
   type MatrixRoomMessageDispatch,
 } from "./media-hold.js";
 import { shouldPromoteRecentInviteRoom } from "./recent-invite.js";
@@ -479,6 +480,7 @@ export async function monitorMatrixProvider(opts: MonitorMatrixOpts = {}): Promi
     const dispatchRoomMessage: MatrixRoomMessageDispatch = (roomId, event, lifecycle) =>
       monitorTaskRunner.runTask(() => handleRoomMessage(roomId, event, lifecycle));
     const mediaHoldMs = accountConfig.mediaHoldMs ?? 0;
+    const reactionClient = client;
     mediaHold =
       mediaHoldMs > 0
         ? createMatrixMediaHold({
@@ -494,6 +496,16 @@ export async function monitorMatrixProvider(opts: MonitorMatrixOpts = {}): Promi
               directTracker,
               getMemberDisplayName,
             }),
+            // Approval reactions and reaction notifications only ever act on the
+            // bot's own messages; any other reaction is ignored by the handler.
+            reactionMayStartWork: async (roomId, event) => {
+              const targetId = resolveReactionTargetId(event);
+              if (!targetId) {
+                return false;
+              }
+              const target = await reactionClient.getEvent(roomId, targetId).catch(() => null);
+              return typeof target?.sender === "string" && target.sender.trim() === auth.userId;
+            },
             logVerboseMessage,
           })
         : null;
