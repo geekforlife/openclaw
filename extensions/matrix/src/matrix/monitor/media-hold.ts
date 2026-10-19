@@ -35,7 +35,7 @@ export type MatrixRoomMessageDispatch = (
   lifecycle: ChannelIngressMonitorLifecycle,
 ) => Promise<ChannelIngressMonitorDeliveryResult | void>;
 
-type HoldKind = "media" | "text" | "other";
+type HoldKind = "media" | "text" | "other" | "reaction";
 
 type HoldEntry = {
   roomId: string;
@@ -199,7 +199,7 @@ function classifyHoldKind(event: MatrixRawEvent, selfUserId: string): HoldKind |
     return "other";
   }
   if (event.type === EventType.Reaction) {
-    return "other";
+    return "reaction";
   }
   if (event.type !== EventType.RoomMessage) {
     return undefined;
@@ -335,6 +335,16 @@ export function createMatrixMediaHold(params: {
   const onRoomMessage: MatrixRoomMessageDispatch = async (roomId, event, lifecycle) => {
     const kind = closed ? undefined : classifyHoldKind(event, params.selfUserId);
     if (!kind) {
+      return await params.dispatch(roomId, event, lifecycle);
+    }
+    if (kind === "reaction") {
+      // A reaction's thread is only known once its target is fetched, so it cannot
+      // be keyed; release every attachment held in the room before it goes on.
+      await Promise.all(
+        Array.from(heldByKey.values())
+          .filter((held) => held.roomId === roomId)
+          .map((held) => debouncer.flushKey(held.key)),
+      );
       return await params.dispatch(roomId, event, lifecycle);
     }
     const key = `${roomId}\0${resolveMatrixThreadRootId(asRoomMessageContent(event)) ?? ""}`;

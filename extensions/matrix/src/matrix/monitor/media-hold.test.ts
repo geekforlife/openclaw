@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vite
 import { installMatrixMonitorTestRuntime } from "../../test-runtime.js";
 import {
   createMatrixHandlerTestHarness,
+  createMatrixReactionEvent,
   createMatrixRoomMessageEvent,
   createMatrixTextMessageEvent,
 } from "./handler.test-helpers.js";
@@ -26,6 +27,7 @@ const ROOM = "!dm:example.org";
 const USER = "@user:example.org";
 const BOT = "@bot:example.org";
 const HOLD_MS = 20_000;
+const THREADED = { "m.relates_to": { rel_type: "m.thread", event_id: "$root" } } as const;
 
 function imageEvent(
   eventId: string,
@@ -281,6 +283,29 @@ describe("createMatrixMediaHold", () => {
       claim(),
     );
     expect(ids()).toEqual(["$editedText", "$image", "$editedImage"]);
+  });
+
+  it("releases every attachment held in the room before a reaction, whatever its thread", async () => {
+    const order: string[] = [];
+    const { hold, ids } = createHold({
+      onDispatch: async ({ event, lifecycle }) => {
+        order.push(`start:${event.event_id}`);
+        await lifecycle.onAdopted();
+        order.push(`adopted:${event.event_id}`);
+      },
+    });
+
+    await hold.onRoomMessage(ROOM, imageEvent("$threadImage", THREADED), claim());
+    await hold.onRoomMessage(ROOM, imageEvent("$roomImage"), claim());
+    await hold.onRoomMessage(
+      ROOM,
+      createMatrixReactionEvent({ eventId: "$reaction", targetEventId: "$threadImage", key: "👍" }),
+      claim(),
+    );
+
+    expect(ids().toSorted()).toEqual(["$reaction", "$roomImage", "$threadImage"]);
+    expect(order.at(-2)).toBe("start:$reaction");
+    expect(order.slice(0, 4).filter((step) => step.startsWith("adopted:"))).toHaveLength(2);
   });
 
   it("only joins text from the same thread", async () => {
