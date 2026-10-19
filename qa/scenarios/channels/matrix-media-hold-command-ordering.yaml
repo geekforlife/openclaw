@@ -1,4 +1,4 @@
-title: Matrix media hold admits a held attachment before a control command that follows it
+title: Matrix media hold answers both a held attachment and the control command sent while it was held
 scenario:
   id: matrix-media-hold-command-ordering
   surface: channels

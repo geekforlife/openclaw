@@ -219,7 +219,12 @@ export async function runMediaHoldStandaloneTimeoutScenario(context: MatrixQaSce
   } satisfies MatrixQaScenarioExecution;
 }
 
-/** A control command after a held attachment: the attachment's turn is admitted first. */
+/**
+ * A control command sent while an attachment is held: the attachment is released
+ * on its own (never folded into the command, never lost) and both are answered.
+ * Reply order is not asserted: a command answers synchronously while the
+ * attachment's turn goes through the model.
+ */
 export async function runMediaHoldCommandOrderingScenario(context: MatrixQaScenarioContext) {
   const roomId = resolveMatrixQaScenarioRoomId(context, MATRIX_QA_DRIVER_DM_ROOM_KEY);
   const { client, startSince } = await primeMatrixQaDriverScenarioClient(context);
@@ -230,36 +235,44 @@ export async function runMediaHoldCommandOrderingScenario(context: MatrixQaScena
     startSince,
   );
   const driverEventId = await client.sendTextMessage({ body: "/status", roomId });
-  const first = await client.waitForRoomEvent({
-    observedEvents: context.observedEvents,
-    predicate: (event) => isSutMessage(event, roomId, context.sutUserId),
-    roomId,
-    since: attachmentEvent.since,
-    timeoutMs: context.timeoutMs,
-  });
-  const second = await client.waitForRoomEvent({
-    observedEvents: context.observedEvents,
-    predicate: (event) =>
-      isSutMessage(event, roomId, context.sutUserId) && event.eventId !== first.event.eventId,
-    roomId,
-    since: first.since,
-    timeoutMs: context.timeoutMs,
-  });
+  const isModelReply = (event: MatrixQaObservedEvent) =>
+    isSutMessage(event, roomId, context.sutUserId) &&
+    (event.body ?? "").startsWith(MOCK_REPLY_PREFIX);
+  const isCommandReply = (event: MatrixQaObservedEvent) =>
+    isSutMessage(event, roomId, context.sutUserId) &&
+    !(event.body ?? "").startsWith(MOCK_REPLY_PREFIX);
+  const [modelReply, commandReply] = await Promise.all([
+    client.waitForRoomEvent({
+      observedEvents: context.observedEvents,
+      predicate: isModelReply,
+      roomId,
+      since: attachmentEvent.since,
+      timeoutMs: context.timeoutMs,
+    }),
+    client.waitForRoomEvent({
+      observedEvents: context.observedEvents,
+      predicate: isCommandReply,
+      roomId,
+      since: attachmentEvent.since,
+      timeoutMs: context.timeoutMs,
+    }),
+  ]);
   advanceMatrixQaActorCursor({
     actorId: "driver",
     syncState: context.syncState,
-    nextSince: second.since,
+    nextSince: modelReply.since,
     startSince,
   });
-  const firstIsModelReply = (first.event.body ?? "").startsWith(MOCK_REPLY_PREFIX);
-  const secondIsModelReply = (second.event.body ?? "").startsWith(MOCK_REPLY_PREFIX);
-  if (!firstIsModelReply || secondIsModelReply) {
-    throw new Error(
-      `command-ordering: expected the attachment's model reply before the /status reply; recent room events: ${JSON.stringify(describeRecentRoomEvents(context, roomId))}`,
+  const firstReply = buildMatrixReplyArtifact(modelReply.event);
+  const secondReply = buildMatrixReplyArtifact(commandReply.event);
+  const observedOrder = context.observedEvents
+    .filter(
+      (event) =>
+        event.eventId === modelReply.event.eventId || event.eventId === commandReply.event.eventId,
+    )
+    .map((event) =>
+      event.eventId === modelReply.event.eventId ? "attachment reply" : "/status reply",
     );
-  }
-  const firstReply = buildMatrixReplyArtifact(first.event);
-  const secondReply = buildMatrixReplyArtifact(second.event);
   return {
     artifacts: {
       attachmentEventId,
@@ -274,8 +287,12 @@ export async function runMediaHoldCommandOrderingScenario(context: MatrixQaScena
       `hold: ${MATRIX_QA_MEDIA_HOLD_MS}ms`,
       `captionless attachment event: ${attachmentEventId}`,
       `/status event right after it: ${driverEventId}`,
-      ...buildMatrixReplyDetails("first SUT message (model reply to the attachment)", firstReply),
-      ...buildMatrixReplyDetails("second SUT message (/status reply)", secondReply),
+      ...buildMatrixReplyDetails(
+        "model reply to the attachment (not folded into the command)",
+        firstReply,
+      ),
+      ...buildMatrixReplyDetails("/status reply", secondReply),
+      `observed reply order: ${[...new Set(observedOrder)].join(", ")}`,
     ].join("\n"),
   } satisfies MatrixQaScenarioExecution;
 }
