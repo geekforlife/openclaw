@@ -469,6 +469,71 @@ describe("createMatrixMediaHold", () => {
     expect(ids()).toEqual(["$onImage", "$onOther", "$text", "$image2", "$onBot"]);
   });
 
+  it("pairs an expired replayed attachment with the text already queued behind it", async () => {
+    const { hold, calls, ids } = createHold();
+    const sentAt = Date.now() - HOLD_MS - 5_000;
+    const image = createMatrixRoomMessageEvent({
+      eventId: "$oldImage",
+      sender: USER,
+      originServerTs: sentAt,
+      content: { msgtype: "m.image", body: "photo.png", url: "mxc://example.org/photo" },
+    });
+    image.room_id = ROOM;
+    const text = createMatrixTextMessageEvent({
+      eventId: "$oldText",
+      body: "what is this?",
+      originServerTs: sentAt + 3_000,
+    });
+    text.room_id = ROOM;
+    const backlogRow = {
+      id: text.event_id,
+      payload: { version: 1, roomId: ROOM, event: text },
+      receivedAt: 1,
+      updatedAt: 1,
+      attempts: 0,
+    } as never;
+
+    await expect(
+      hold.onRoomMessage(ROOM, image, claim({ readLaneBacklog: async () => [backlogRow] })),
+    ).resolves.toEqual({ kind: "deferred" });
+    expect(ids()).toEqual([]);
+    await hold.onRoomMessage(ROOM, text, claim());
+    expect(ids()).toEqual(["$oldText"]);
+    expect(calls[0]?.event.content).toMatchObject({ msgtype: "m.image", body: "what is this?" });
+
+    // Without a queued companion, an expired attachment goes straight on.
+    const lone = createMatrixRoomMessageEvent({
+      eventId: "$loneOld",
+      sender: USER,
+      originServerTs: sentAt,
+      content: { msgtype: "m.image", body: "photo.png", url: "mxc://example.org/photo" },
+    });
+    await hold.onRoomMessage(ROOM, lone, claim({ readLaneBacklog: async () => [] }));
+    expect(ids()).toEqual(["$oldText", "$loneOld"]);
+  });
+
+  it("lets verification traffic through without releasing a hold", async () => {
+    const { hold, ids } = createHold();
+
+    await hold.onRoomMessage(ROOM, imageEvent("$image"), claim());
+    await hold.onRoomMessage(
+      ROOM,
+      createMatrixRoomMessageEvent({
+        eventId: "$verify",
+        sender: USER,
+        content: {
+          msgtype: "m.key.verification.request",
+          body: "verify me",
+          methods: ["m.sas.v1"],
+        },
+      }),
+      claim(),
+    );
+    expect(ids()).toEqual(["$verify"]);
+    await hold.onRoomMessage(ROOM, textEvent("$text", "what is this?"), claim());
+    expect(ids()).toEqual(["$verify", "$text"]);
+  });
+
   it("only joins text from the same thread", async () => {
     const { hold, ids } = createHold();
 

@@ -503,7 +503,12 @@ export async function monitorMatrixProvider(opts: MonitorMatrixOpts = {}): Promi
               if (!targetId) {
                 return false;
               }
-              const target = await reactionClient.getEvent(roomId, targetId).catch(() => null);
+              const target = await reactionClient.getEvent(roomId, targetId).catch(() => undefined);
+              if (target === undefined) {
+                // Unknown target: keep delivery order rather than risk the reaction
+                // overtaking a held attachment.
+                return true;
+              }
               return typeof target?.sender === "string" && target.sender.trim() === auth.userId;
             },
             logVerboseMessage,

@@ -28,6 +28,7 @@ import {
 import { resolveMatrixCommandCheckText } from "./mentions.js";
 import { resolveMatrixInboundRouteAsync } from "./route.js";
 import { EventType, type MatrixRawEvent, type RoomMessageEventContent } from "./types.js";
+import { isMatrixVerificationRoomMessage } from "./verification-utils.js";
 
 export type MatrixRoomMessageDispatch = (
   roomId: string,
@@ -43,6 +44,8 @@ type HoldEntry = {
   lifecycle: ChannelIngressMonitorLifecycle;
   key: string;
   kind: HoldKind;
+  /** Hold window to use instead of the one derived from the attachment's age. */
+  windowMs?: number;
   heartbeat?: ReturnType<typeof setInterval>;
   onAbort?: () => void;
 };
@@ -184,6 +187,22 @@ export function createMatrixHoldControlCommandCheck(params: {
   };
 }
 
+function isQueuedMatrixEvent(value: unknown): value is { event: MatrixRawEvent } {
+  if (!value || typeof value !== "object" || !("event" in value)) {
+    return false;
+  }
+  const event = value.event;
+  return (
+    event !== null &&
+    typeof event === "object" &&
+    "event_id" in event &&
+    typeof event.event_id === "string" &&
+    "content" in event &&
+    event.content !== null &&
+    typeof event.content === "object"
+  );
+}
+
 /** The event a reaction annotates, if the relation is well formed. */
 export function resolveReactionTargetId(event: MatrixRawEvent): string | undefined {
   const relation = asRoomMessageContent(event)["m.relates_to"];
@@ -225,6 +244,9 @@ function classifyHoldKind(event: MatrixRawEvent, selfUserId: string): HoldKind |
   if (content["m.relates_to"]?.rel_type === RelationType.Replace) {
     return undefined;
   }
+  if (isMatrixVerificationRoomMessage({ msgtype: content.msgtype, body: content.body })) {
+    return undefined;
+  }
   if (isHoldableMedia(content)) {
     return "media";
   }
@@ -238,6 +260,37 @@ function classifyHoldKind(event: MatrixRawEvent, selfUserId: string): HoldKind |
  * conversation, a second attachment, a control command or the deadline dispatches
  * the held attachment alone first, exactly as without the hold.
  */
+/**
+ * Whether a text from the attachment's sender, sent within the hold window and
+ * in the same room and thread, is already durable behind it in the lane.
+ */
+async function hasQueuedCompanionText(
+  media: MatrixRawEvent,
+  key: string,
+  lifecycle: ChannelIngressMonitorLifecycle,
+  holdMs: number,
+): Promise<boolean> {
+  const rows = await lifecycle.readLaneBacklog?.().catch(() => []);
+  return (rows ?? []).some((row) => {
+    if (!isQueuedMatrixEvent(row.payload)) {
+      return false;
+    }
+    const queued = row.payload.event;
+    if (queued.type !== EventType.RoomMessage || queued.sender !== media.sender) {
+      return false;
+    }
+    const content = asRoomMessageContent(queued);
+    const body = typeof content.body === "string" ? content.body.trim() : "";
+    const queuedKey = `${media.room_id ?? ""}\0${resolveMatrixThreadRootId(content) ?? ""}`;
+    return (
+      content.msgtype === "m.text" &&
+      body.length > 0 &&
+      queuedKey === key &&
+      isWithinHoldWindow(media, queued, holdMs)
+    );
+  });
+}
+
 export function createMatrixMediaHold(params: {
   holdMs: number;
   selfUserId: string;
@@ -295,12 +348,13 @@ export function createMatrixMediaHold(params: {
   const debouncer = createInboundDebouncer<HoldEntry>({
     debounceMs: holdMs,
     // The window is measured from the attachment; a joining text never extends it.
-    maxWaitMs: (entry) => (entry.kind === "media" ? remainingHoldMs(entry.event) : holdMs),
+    maxWaitMs: (entry) =>
+      entry.kind === "media" ? (entry.windowMs ?? remainingHoldMs(entry.event)) : holdMs,
     buildKey: (entry) => entry.key,
     shouldDebounce: (entry) => entry.kind !== "other",
     resolveDebounceMs: (entry, pending) =>
       entry.kind === "media"
-        ? remainingHoldMs(entry.event)
+        ? (entry.windowMs ?? remainingHoldMs(entry.event))
         : entry.kind === "text" && pending
           ? holdMs
           : 0,
@@ -421,14 +475,18 @@ export function createMatrixMediaHold(params: {
       return await params.dispatch(roomId, event, lifecycle);
     }
     const key = `${roomId}\0${resolveMatrixThreadRootId(asRoomMessageContent(event)) ?? ""}`;
-    // A replayed attachment whose window has already passed goes straight on.
-    const entry: HoldEntry = {
-      roomId,
-      event,
-      lifecycle,
-      key,
-      kind: kind === "media" && remainingHoldMs(event) <= 0 ? "other" : kind,
-    };
+    const entry: HoldEntry = { roomId, event, lifecycle, key, kind };
+    if (kind === "media" && remainingHoldMs(event) <= 0) {
+      // A replayed attachment whose window has passed goes straight on, unless the
+      // text that belongs to it is already queued behind it in the same lane (an
+      // outage longer than the hold): then it waits for that text, which the lane
+      // delivers next, so recovery still produces one turn.
+      if (await hasQueuedCompanionText(event, key, lifecycle, holdMs)) {
+        entry.windowMs = holdMs;
+      } else {
+        entry.kind = "other";
+      }
+    }
     if (entry.kind === "media") {
       hold(entry);
       void debouncer.enqueue(entry);

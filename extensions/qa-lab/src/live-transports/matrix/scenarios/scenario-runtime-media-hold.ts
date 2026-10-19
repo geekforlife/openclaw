@@ -19,6 +19,7 @@ import {
   buildMatrixReplyDetails,
   isMatrixQaMessageLikeKind,
   primeMatrixQaDriverScenarioClient,
+  resolveMatrixQaNoReplyWindowMs,
   truncateMatrixQaPreview,
   type MatrixQaScenarioContext,
 } from "./scenario-runtime-shared.js";
@@ -424,12 +425,25 @@ export async function runMatrixQaE2eeMediaHoldScenario(
         timeoutMs: context.timeoutMs,
       });
       const reply = buildMatrixReplyArtifact(matched.event);
+      const noReplyWindowMs = resolveMatrixQaNoReplyWindowMs(context.timeoutMs);
+      const second = await client.waitForOptionalRoomEvent({
+        predicate: (event) =>
+          isSutMessage(event, roomId, context.sutUserId) && event.eventId !== matched.event.eventId,
+        roomId,
+        timeoutMs: noReplyWindowMs,
+      });
+      if (second.matched) {
+        throw new Error(
+          `e2ee media hold: a second SUT reply ${second.event.eventId} followed the joined turn within ${noReplyWindowMs}ms`,
+        );
+      }
       return {
         artifacts: {
           attachmentEventId,
           attachmentFilename: MATRIX_QA_IMAGE_ATTACHMENT_FILENAME,
           driverEventId,
           driverUserId,
+          expectedNoReplyWindowMs: noReplyWindowMs,
           reply,
           roomKey,
           roomId,
@@ -442,6 +456,7 @@ export async function runMatrixQaE2eeMediaHoldScenario(
           `captionless encrypted attachment event: ${attachmentEventId} (no SUT reply for ${quietMs}ms; observed ${attachmentEvent.event.eventId})`,
           `text event ${quietMs}ms later: ${driverEventId}`,
           ...buildMatrixReplyDetails("one reply that saw the image", reply),
+          `no second reply for ${noReplyWindowMs}ms`,
         ].join("\n"),
       };
     },
