@@ -17,6 +17,7 @@ import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runti
 import type { CoreConfig, MatrixConfig } from "../../types.js";
 import { resolveMatrixMessageAttachment } from "../media-text.js";
 import { isPollEventType } from "../poll-types.js";
+import { extractMatrixReactionAnnotation } from "../reaction-common.js";
 import { resolveMatrixThreadRootId } from "../relations.js";
 import { RelationType } from "../send/types.js";
 import type { createDirectRoomTracker } from "./direct.js";
@@ -203,12 +204,9 @@ function isQueuedMatrixEvent(value: unknown): value is { event: MatrixRawEvent }
   );
 }
 
-/** The event a reaction annotates, if the relation is well formed. */
+/** The event a reaction annotates, read the way the reaction handler reads it. */
 export function resolveReactionTargetId(event: MatrixRawEvent): string | undefined {
-  const relation = asRoomMessageContent(event)["m.relates_to"];
-  return relation?.rel_type === "m.annotation" && typeof relation.event_id === "string"
-    ? relation.event_id
-    : undefined;
+  return extractMatrixReactionAnnotation(event.content)?.eventId;
 }
 
 function isWithinHoldWindow(media: MatrixRawEvent, text: MatrixRawEvent, holdMs: number) {
@@ -222,13 +220,28 @@ function isWithinHoldWindow(media: MatrixRawEvent, text: MatrixRawEvent, holdMs:
  * an original the server already bundles a replacement for) bypasses the hold
  * so it can never release an attachment early or be folded into one.
  */
-function classifyHoldKind(event: MatrixRawEvent, selfUserId: string): HoldKind | undefined {
+/** Events the handler never turns into work: the bot's own, redacted, edited, verification. */
+function isIgnoredByHandler(event: MatrixRawEvent, selfUserId: string): boolean {
   if (
     !event.sender ||
     event.sender === selfUserId ||
     event.unsigned?.redacted_because ||
     hasBundledMatrixReplacementRelation(event)
   ) {
+    return true;
+  }
+  if (event.type !== EventType.RoomMessage) {
+    return false;
+  }
+  const content = asRoomMessageContent(event);
+  return (
+    content["m.relates_to"]?.rel_type === RelationType.Replace ||
+    isMatrixVerificationRoomMessage({ msgtype: content.msgtype, body: content.body })
+  );
+}
+
+function classifyHoldKind(event: MatrixRawEvent, selfUserId: string): HoldKind | undefined {
+  if (isIgnoredByHandler(event, selfUserId)) {
     return undefined;
   }
   if (isPollEventType(event.type) || event.type === EventType.Location) {
@@ -241,12 +254,6 @@ function classifyHoldKind(event: MatrixRawEvent, selfUserId: string): HoldKind |
     return undefined;
   }
   const content = asRoomMessageContent(event);
-  if (content["m.relates_to"]?.rel_type === RelationType.Replace) {
-    return undefined;
-  }
-  if (isMatrixVerificationRoomMessage({ msgtype: content.msgtype, body: content.body })) {
-    return undefined;
-  }
   if (isHoldableMedia(content)) {
     return "media";
   }
@@ -269,6 +276,7 @@ async function hasQueuedCompanionText(
   key: string,
   lifecycle: ChannelIngressMonitorLifecycle,
   holdMs: number,
+  selfUserId: string,
 ): Promise<boolean> {
   const rows = await lifecycle.readLaneBacklog?.().catch(() => []);
   return (rows ?? []).some((row) => {
@@ -276,7 +284,11 @@ async function hasQueuedCompanionText(
       return false;
     }
     const queued = row.payload.event;
-    if (queued.type !== EventType.RoomMessage || queued.sender !== media.sender) {
+    if (
+      queued.type !== EventType.RoomMessage ||
+      queued.sender !== media.sender ||
+      isIgnoredByHandler(queued, selfUserId)
+    ) {
       return false;
     }
     const content = asRoomMessageContent(queued);
@@ -481,7 +493,7 @@ export function createMatrixMediaHold(params: {
       // text that belongs to it is already queued behind it in the same lane (an
       // outage longer than the hold): then it waits for that text, which the lane
       // delivers next, so recovery still produces one turn.
-      if (await hasQueuedCompanionText(event, key, lifecycle, holdMs)) {
+      if (await hasQueuedCompanionText(event, key, lifecycle, holdMs, params.selfUserId)) {
         entry.windowMs = holdMs;
       } else {
         entry.kind = "other";

@@ -512,6 +512,56 @@ describe("createMatrixMediaHold", () => {
     expect(ids()).toEqual(["$oldText", "$loneOld"]);
   });
 
+  it("does not treat a queued edit as companion text for an expired replay", async () => {
+    const { hold, ids } = createHold();
+    const sentAt = Date.now() - HOLD_MS - 5_000;
+    const image = createMatrixRoomMessageEvent({
+      eventId: "$oldImage",
+      sender: USER,
+      originServerTs: sentAt,
+      content: { msgtype: "m.image", body: "photo.png", url: "mxc://example.org/photo" },
+    });
+    image.room_id = ROOM;
+    const edit = createMatrixTextMessageEvent({
+      eventId: "$edit",
+      body: "* fixed typo",
+      originServerTs: sentAt + 3_000,
+      relatesTo: { rel_type: "m.replace", event_id: "$earlier" },
+    });
+    edit.room_id = ROOM;
+    const backlogRow = {
+      id: edit.event_id,
+      payload: { version: 1, roomId: ROOM, event: edit },
+      receivedAt: 1,
+      updatedAt: 1,
+      attempts: 0,
+    } as never;
+
+    await hold.onRoomMessage(ROOM, image, claim({ readLaneBacklog: async () => [backlogRow] }));
+    expect(ids()).toEqual(["$oldImage"]);
+  });
+
+  it("recognises a reaction without an explicit relation type like the handler does", async () => {
+    const reactionMayStartWork = vi.fn(async () => true);
+    const { hold, ids } = createHold({ reactionMayStartWork });
+
+    await hold.onRoomMessage(ROOM, imageEvent("$image"), claim());
+    await hold.onRoomMessage(
+      ROOM,
+      {
+        type: "m.reaction",
+        sender: USER,
+        event_id: "$legacyReaction",
+        origin_server_ts: Date.now(),
+        content: { "m.relates_to": { event_id: "$image", key: "👍" } },
+      } as MatrixRawEvent,
+      claim(),
+    );
+    // It targets the held attachment, so the hold is kept and the owner is not asked.
+    expect(ids()).toEqual(["$legacyReaction"]);
+    expect(reactionMayStartWork).not.toHaveBeenCalled();
+  });
+
   it("lets verification traffic through without releasing a hold", async () => {
     const { hold, ids } = createHold();
 
