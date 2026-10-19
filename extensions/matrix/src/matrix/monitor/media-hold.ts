@@ -240,7 +240,22 @@ export function createMatrixMediaHold(params: {
 }) {
   const { holdMs } = params;
   const heldByKey = new Map<string, HoldEntry>();
+  // Flushes that have left the hold but whose turn is not yet admitted, per room.
+  const admittingByRoom = new Map<string, Set<Promise<void>>>();
   let closed = false;
+
+  const trackAdmission = (roomId: string, admission: Promise<void>) => {
+    const pending = admittingByRoom.get(roomId) ?? new Set<Promise<void>>();
+    pending.add(admission);
+    admittingByRoom.set(roomId, pending);
+    const untrack = () => {
+      pending.delete(admission);
+      if (pending.size === 0 && admittingByRoom.get(roomId) === pending) {
+        admittingByRoom.delete(roomId);
+      }
+    };
+    void admission.then(untrack, untrack);
+  };
 
   const forget = (entry: HoldEntry) => {
     if (heldByKey.get(entry.key) === entry) {
@@ -282,7 +297,7 @@ export function createMatrixMediaHold(params: {
       const { lifecycle, settle, abandon } = fanInChannelIngressLifecycles(
         entries.map((entry) => entry.lifecycle),
       );
-      return createFlush({
+      const flush = createFlush({
         lifecycle,
         dispatch: async (admissionLifecycle) => {
           if (!first) {
@@ -308,6 +323,10 @@ export function createMatrixMediaHold(params: {
           }
         },
       });
+      if (first) {
+        trackAdmission(first.roomId, flush.admission);
+      }
+      return flush;
     },
     onError: (error, entries) => {
       params.logVerboseMessage(
@@ -320,8 +339,15 @@ export function createMatrixMediaHold(params: {
         if (entry.lifecycle.abortSignal.aborted) {
           continue;
         }
-        // Ownership ends before any turn: reopen the claim for the next start.
-        void (entry.lifecycle.onCancelled?.() ?? entry.lifecycle.onAbandoned());
+        // Ownership ends before any turn: reopen the claim for the next start. The
+        // drain keeps a claim whose release failed, so log and move on.
+        void Promise.resolve(
+          entry.lifecycle.onCancelled?.() ?? entry.lifecycle.onAbandoned(),
+        ).catch((error: unknown) => {
+          params.logVerboseMessage(
+            `matrix: media hold could not reopen claim room=${entry.roomId} id=${entry.event.event_id}: ${String(error)}`,
+          );
+        });
       }
     },
   });
@@ -351,12 +377,14 @@ export function createMatrixMediaHold(params: {
     }
     if (kind === "reaction") {
       // A reaction's thread is only known once its target is fetched, so it cannot
-      // be keyed; release every attachment held in the room before it goes on.
+      // be keyed; release every attachment held in the room, and let attachments
+      // already on their way to a turn be admitted, before it goes on.
       await Promise.all(
         Array.from(heldByKey.values())
           .filter((held) => held.roomId === roomId)
           .map((held) => debouncer.flushKey(held.key)),
       );
+      await Promise.allSettled(Array.from(admittingByRoom.get(roomId) ?? []));
       return await params.dispatch(roomId, event, lifecycle);
     }
     const key = `${roomId}\0${resolveMatrixThreadRootId(asRoomMessageContent(event)) ?? ""}`;

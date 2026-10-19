@@ -335,6 +335,67 @@ describe("createMatrixMediaHold", () => {
     expect(ids()).toEqual(["$stale", "$later"]);
   });
 
+  it("lets an attachment already on its way to a turn be admitted before a reaction", async () => {
+    const order: string[] = [];
+    let admitImage: () => void = () => {};
+    const { hold } = createHold({
+      onDispatch: async ({ event, lifecycle }) => {
+        order.push(`start:${event.event_id}`);
+        if (event.event_id === "$image") {
+          await new Promise<void>((resolve) => {
+            admitImage = resolve;
+          });
+        }
+        await lifecycle.onAdopted();
+        order.push(`adopted:${event.event_id}`);
+      },
+    });
+
+    await hold.onRoomMessage(ROOM, imageEvent("$image"), claim());
+    await vi.advanceTimersByTimeAsync(HOLD_MS);
+    expect(order).toEqual(["start:$image"]);
+
+    const reaction = hold.onRoomMessage(
+      ROOM,
+      createMatrixReactionEvent({ eventId: "$reaction", targetEventId: "$image", key: "👍" }),
+      claim(),
+    );
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(order).toEqual(["start:$image"]);
+    admitImage();
+    await reaction;
+
+    expect(order).toEqual([
+      "start:$image",
+      "adopted:$image",
+      "start:$reaction",
+      "adopted:$reaction",
+    ]);
+  });
+
+  it("logs instead of rejecting when a held claim cannot be reopened on close", async () => {
+    const logged: string[] = [];
+    const hold = createMatrixMediaHold({
+      holdMs: HOLD_MS,
+      selfUserId: BOT,
+      dispatch: async () => {},
+      isControlCommand: async () => false,
+      logVerboseMessage: (message) => logged.push(message),
+    });
+    const media = claim({
+      onCancelled: vi.fn(async () => {
+        throw new Error("queue write failed");
+      }),
+    });
+
+    await hold.onRoomMessage(ROOM, imageEvent("$image"), media);
+    hold.close();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(media.onCancelled).toHaveBeenCalledTimes(1);
+    expect(logged.some((line) => line.includes("could not reopen claim"))).toBe(true);
+  });
+
   it("only joins text from the same thread", async () => {
     const { hold, ids } = createHold();
 
